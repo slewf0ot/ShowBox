@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+createcue — make a cue WAV with spoken title + (click or spoken count-in).
+
+Default priority:
+ - Piper TTS (offline) if `piper` exists and PIPER_MODEL is set
+ - Else OpenAI TTS if OPENAI_API_KEY is set
+ - Else Coqui if `tts` exists
+ - Else pico2wave/espeak fallback
+
+Writes:
+  /home/fc/showbox/cues/<NN>_workcue.wav
+
+Usage:
+  createcue 01 "Amos Moses" tempo 120
+
+Options:
+  --beats N          number of beats (default 4)
+  --count            speak the count-in (instead of clicks)
+  --lead SECONDS     pause between title and count/clicks (default 0.20)
+  --pause SECONDS    pause after title before lead (legacy; kept) (default 0.25)
+  --prefer-openai    prefer OpenAI over Piper
+  --voice NAME       OpenAI voice (if OpenAI chosen) (default cedar)
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+BASE_CUES_DIR = Path("/home/fc/showbox/cues")
+TARGET_SR = 44100
+TARGET_CH = 1
+
+SOX = shutil.which("sox")
+PICO2WAVE = shutil.which("pico2wave") or shutil.which("espeak-ng") or shutil.which("espeak")
+COQUI_CLI = shutil.which("tts")
+
+PIPER = shutil.which("piper")
+PIPER_MODEL = os.environ.get("PIPER_MODEL", "").strip()
+
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+
+
+def run(cmd, check=True, input_text=None):
+    r = subprocess.run(
+        cmd,
+        input=input_text,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if check and r.returncode != 0:
+        raise RuntimeError(f"cmd failed: {' '.join(cmd)}\n{r.stderr.strip()}")
+    return r
+
+
+def sox_resample(src: Path, dst: Path):
+    run([SOX, str(src), "-r", str(TARGET_SR), "-c", str(TARGET_CH), "-b", "16", str(dst)])
+
+
+def sox_silence(seconds: float, dst: Path):
+    run([SOX, "-r", str(TARGET_SR), "-c", str(TARGET_CH), "-b", "16", "-n", str(dst), "trim", "0.0", f"{seconds}"])
+
+
+def sox_click(dst: Path, dur: float = 0.03, freq: float = 1200.0, vol: float = 0.9):
+    run([SOX, "-r", str(TARGET_SR), "-c", str(TARGET_CH), "-b", "16", "-n", str(dst),
+         "synth", f"{dur}", "sine", f"{freq}", "vol", f"{vol}"])
+
+
+def tts_piper(text: str, out_path: Path):
+    if not PIPER:
+        raise RuntimeError("piper not found in PATH")
+    if not PIPER_MODEL:
+        raise RuntimeError("PIPER_MODEL env var not set")
+    if not Path(PIPER_MODEL).exists():
+        raise RuntimeError(f"PIPER_MODEL not found: {PIPER_MODEL}")
+    run([PIPER, "--model", PIPER_MODEL, "--output_file", str(out_path)], check=True, input_text=text.strip() + "\n")
+
+
+def tts_openai(text: str, out_path: Path, voice: str):
+    if not OPENAI_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    url = "https://api.openai.com/v1/audio/speech"
+    payload = {
+        "model": "gpt-4o-mini-tts",
+        "voice": voice,
+        "input": text.strip(),
+        "response_format": "wav",
+    }
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_KEY}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        out_path.write_bytes(resp.read())
+
+
+def tts_coqui(text: str, out_path: Path):
+    run([COQUI_CLI, "--model", "tts_models/en/ljspeech/tacotron2-DDC", "--out_path", str(out_path), "--text", text])
+
+
+def tts_local_pico(text: str, out_path: Path):
+    tmp = out_path.with_suffix(".raw.wav")
+    if shutil.which("pico2wave"):
+        run(["pico2wave", "-w", str(tmp), text])
+    elif shutil.which("espeak-ng"):
+        run(["espeak-ng", "-w", str(tmp), text])
+    else:
+        run(["espeak", "-w", str(tmp), text])
+    sox_resample(tmp, out_path)
+    tmp.unlink(missing_ok=True)
+
+
+def make_speech(text: str, out_raw: Path, prefer_openai: bool, openai_voice: str):
+    def try_piper():
+        if PIPER and PIPER_MODEL and Path(PIPER_MODEL).exists():
+            tts_piper(text, out_raw)
+            return True
+        return False
+
+    def try_openai():
+        if OPENAI_KEY:
+            tts_openai(text, out_raw, voice=openai_voice)
+            return True
+        return False
+
+    def try_coqui():
+        if COQUI_CLI:
+            tts_coqui(text, out_raw)
+            return True
+        return False
+
+    def try_local():
+        if PICO2WAVE:
+            tts_local_pico(text, out_raw)
+            return True
+        return False
+
+    if prefer_openai:
+        order = [("openai", try_openai), ("piper", try_piper), ("coqui", try_coqui), ("local", try_local)]
+    else:
+        order = [("piper", try_piper), ("openai", try_openai), ("coqui", try_coqui), ("local", try_local)]
+
+    last_err = None
+    for name, fn in order:
+        try:
+            ok = fn()
+            if ok:
+                print(f"[tts: {name}]")
+                return
+        except Exception as e:
+            last_err = e
+            print(f"[{name} tts failed: {e}]", file=sys.stderr)
+
+    raise RuntimeError(f"no TTS engine available (last error: {last_err})")
+
+
+def build_click_track(tmp: Path, beats: int, bpm: float, click_dur: float = 0.03) -> Path:
+    beat = 60.0 / bpm
+    gap = max(0.0, beat - click_dur)
+
+    click = tmp / "click.wav"
+    sox_click(click, dur=click_dur)
+
+    parts = []
+    for i in range(beats):
+        parts.append(str(click))
+        if gap > 0 and i < beats - 1:
+            sil = tmp / f"sil_{i}.wav"
+            sox_silence(gap, sil)
+            parts.append(str(sil))
+
+    out = tmp / "track.wav"
+    run([SOX, *parts, str(out)])
+    return out
+
+
+def build_spoken_count_track(tmp: Path, beats: int, bpm: float,
+                             prefer_openai: bool, openai_voice: str) -> Path:
+    # Make "1 2 3 4 ..." speech, then time-stretch to exactly beats*(60/bpm) seconds.
+    # This keeps a natural voice while being tempo-accurate.
+    target_len = beats * (60.0 / bpm)
+
+    count_text = " ".join(str(i) for i in range(1, beats + 1))
+
+    raw = tmp / "count_raw.wav"
+    norm = tmp / "count.wav"
+    make_speech(count_text, raw, prefer_openai=prefer_openai, openai_voice=openai_voice)
+    sox_resample(raw, norm)
+
+    stretched = tmp / "count_stretched.wav"
+    # sox tempo effect: tempo <factor>. factor >1 speeds up, <1 slows down.
+    # factor = original_len / target_len
+    # We need original length:
+    info = run([SOX, "--i", "-D", str(norm)]).stdout.strip()
+    try:
+        orig_len = float(info)
+    except Exception:
+        orig_len = target_len
+
+    if orig_len <= 0.01:
+        orig_len = target_len
+
+    factor = orig_len / target_len
+
+    # Bound factor to avoid crazy artifacts
+    if factor < 0.5:
+        factor = 0.5
+    if factor > 2.0:
+        factor = 2.0
+
+    run([SOX, str(norm), str(stretched), "tempo", f"{factor}"])
+    return stretched
+
+
+def create_cue(number: str, title: str, bpm: float, outdir: Path,
+               pause_after: float = 0.25, lead: float = 0.20,
+               beats: int = 4, count: bool = False,
+               prefer_openai: bool = False, openai_voice: str = "cedar"):
+    if not SOX:
+        raise RuntimeError("sox is required (sudo apt-get install -y sox)")
+
+    if beats < 1 or beats > 16:
+        raise RuntimeError("beats must be between 1 and 16")
+
+    outdir = outdir.expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+    final_name = outdir / f"{number}_workcue.wav"
+
+    tmp = Path(tempfile.mkdtemp(prefix="createcue_"))
+    try:
+        speech_raw = tmp / "speech_raw.wav"
+        speech = tmp / "speech.wav"
+
+        pause = tmp / "pause.wav"
+        leadwav = tmp / "lead.wav"
+
+        # 1) title speech
+        make_speech(title, speech_raw, prefer_openai=prefer_openai, openai_voice=openai_voice)
+        sox_resample(speech_raw, speech)
+
+        # 2) pauses
+        sox_silence(pause_after, pause)
+        sox_silence(lead, leadwav)
+
+        # 3) build end section (clicks or spoken count)
+        if count:
+            track = build_spoken_count_track(tmp, beats, bpm, prefer_openai=prefer_openai, openai_voice=openai_voice)
+        else:
+            track = build_click_track(tmp, beats, bpm)
+
+        # 4) concat: speech + pause + lead + track
+        run([SOX, str(speech), str(pause), str(leadwav), str(track), str(final_name)])
+
+        print(f"created {final_name}")
+        return final_name
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="createcue")
+    parser.add_argument("number")
+    parser.add_argument("title")
+    parser.add_argument("tempo_kw")
+    parser.add_argument("bpm", type=float)
+
+    parser.add_argument("--outdir", default=str(BASE_CUES_DIR))
+    parser.add_argument("--pause", type=float, default=0.25, help="pause after title (seconds)")
+    parser.add_argument("--lead", type=float, default=0.20, help="extra pause before count/clicks (seconds)")
+
+    parser.add_argument("--beats", type=int, default=4, help="number of beats (default 4)")
+    parser.add_argument("--count", action="store_true", help="speak the count-in instead of clicks")
+
+    parser.add_argument("--prefer-openai", action="store_true", help="prefer OpenAI TTS over Piper")
+    parser.add_argument("--voice", default="cedar", help="OpenAI voice name (used if OpenAI is selected)")
+
+    args = parser.parse_args()
+
+    if args.tempo_kw.lower() != "tempo":
+        print("usage: createcue 01 \"Title\" tempo 120", file=sys.stderr)
+        return 2
+
+    try:
+        create_cue(
+            args.number.zfill(2),
+            args.title,
+            float(args.bpm),
+            Path(args.outdir),
+            pause_after=args.pause,
+            lead=args.lead,
+            beats=args.beats,
+            count=args.count,
+            prefer_openai=args.prefer_openai,
+            openai_voice=args.voice,
+        )
+    except Exception as e:
+        print("ERROR:", e, file=sys.stderr)
+        return 3
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

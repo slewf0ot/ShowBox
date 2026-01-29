@@ -1,0 +1,19 @@
+[Unit]
+Description=MIDI Cue Player
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fc
+WorkingDirectory=/home/fc
+
+ExecStart=/usr/bin/python3 /home/fc/midi_cues.py
+
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+

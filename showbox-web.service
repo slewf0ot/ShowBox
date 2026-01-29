@@ -1,0 +1,16 @@
+[Unit]
+Description=ShowBox Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fc
+WorkingDirectory=/home/fc/showbox/webapp
+ExecStart=/usr/bin/python3 /home/fc/showbox/webapp/app.py
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
