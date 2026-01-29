@@ -1,0 +1,13 @@
+# runtime/state
+state.json
+control.json
+
+# show content
+cues/
+jukebox/songs/
+jukebox/playlists/*.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
