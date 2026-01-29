@@ -1,70 +1,62 @@
 # ShowBox
 
-**ShowBox** is a headless, stage-safe MIDI-driven cue and jukebox system designed for live performance.
+**ShowBox** is a headless, stage-safe MIDI-driven cue and jukebox system for live performance.
 
-It allows an iPad running **OnSong** to trigger audio and MIDI cues on a Raspberry Pi over RTP-MIDI, with deterministic behavior and zero GUI dependencies.
-
----
-
-## Core Features
-
-- 🎹 MIDI cue triggering via RTP-MIDI (OnSong → Raspberry Pi)
-- 🎧 Plays WAV / MP3 / MIDI files
-- 🎙 Offline neural TTS cue generation (Piper TTS)
-- 🎛 Web UI for cue + jukebox management
-- 🧠 Deterministic “show-safe” behavior (debounce, exclusive playback)
-- 🔁 Fully rebuildable from a fresh OS install
+It allows an iPad running **OnSong** to trigger audio and MIDI cues on a Raspberry Pi over RTP-MIDI, with deterministic behavior and minimal moving parts.
 
 ---
 
-## High-Level Architecture
+## Quick links
 
+- Architecture: `docs/architecture.md`
+- Headless rebuild: `docs/headless-rebuild.md`
+- Web UI: `docs/web-ui.md`
+- MIDI mapping: `docs/midi-mapping.md`
+- Troubleshooting: `docs/troubleshooting.md`
+
+---
+
+## High-level architecture
+
+```text
 OnSong (iPad)
-→ RTP-MIDI
-→ rtpmidid
-→ ALSA Midi Through (14:0)
-→ midi_cues.py
-→ audio / midi playback
+  → RTP-MIDI (Apple network session)
+    → rtpmidid (Raspberry Pi)
+      → ALSA sequencer
+        → Midi Through Port-0 (stable destination)
+          → midi_cues.py (cue/jukebox engine)
+            → playback (mpv/aplay/aplaymidi)
+```
 
-
-The web UI communicates with the cue engine via **file-based IPC**, not sockets.
-
----
-
-## Repository Layout
-
-showbox/
-README.md
-docs/
-architecture.md
-headless-rebuild.md
-web-ui.md
-troubleshooting.md
-midi-mapping.md
-services/
-midicues.service
-showbox-web.service
-scripts/
-install.sh
-status.sh
-midi_connect.sh
-createcue
-webapp/
-app.py
-player/
-midi_cues.py
-config/
-config.json.example
-
+Key principle: **the cue engine listens only to ALSA Midi Through**, never directly to volatile RTP peer ports.
 
 ---
 
-## Quick Start (Existing System)
+## Web UI contract (important)
 
-```bash
-sudo systemctl status midicues
-sudo systemctl status showbox-web
+The web UI is intentionally lightweight. It does **management** and **status**, not timing-critical playback.
 
-Web UI:
+- Reads: `config.json`, `state.json`
+- Writes: `control.json` (one-shot command file)
+- Cue engine polls `control.json`, executes once, then deletes it
 
-http://<pi-ip>:8080
+---
+
+## Repo layout (recommended)
+
+```text
+ShowBox/
+  README.md
+  docs/
+  services/
+  scripts/
+  webapp/
+  player/
+  config/
+```
+
+---
+
+## Rebuild from scratch
+
+Follow: `docs/headless-rebuild.md`
